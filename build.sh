@@ -82,13 +82,15 @@ done
 # curl with retries gets through. When the build stops on a dependency
 # download, fetch it with curl into Zig's package cache and try again.
 log="$work/build.log"
+echo "building herdr $version (a few minutes the first time)"
 for attempt in $(seq 1 15); do
-  if (cd "$src" && ZIG="$zig" cargo build --release --quiet) 2>"$log"; then
+  # Show cargo's progress while keeping a copy of its output for the check below.
+  if (cd "$src" && ZIG="$zig" CARGO_TERM_PROGRESS_WHEN=always \
+      CARGO_TERM_PROGRESS_WIDTH="$(tput cols 2>/dev/null || echo 80)" cargo build --release) 2>&1 | tee "$log"; then
     break
   fi
   url=$(grep -A1 "unable to connect to server" "$log" | grep -oE 'https://[^"]+' | head -1 || true)
   if [ -z "$url" ] || [ "$attempt" = 15 ]; then
-    cat "$log" >&2
     exit 1
   fi
   echo "fetching zig dependency $(basename "$url") with curl"
