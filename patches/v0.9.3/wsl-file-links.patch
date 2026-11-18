@@ -1,0 +1,107 @@
+herdr WSL file-link patch for herdr v0.9.3
+https://github.com/Malorn44/herdr-patches
+
+Under WSL, rewrites file:// links that programs in panes print so Windows
+Terminal can open them: file:///home/... becomes
+file://wsl.localhost/<distro>/home/... and file:///mnt/c/... becomes
+file:///C:/... (Windows Terminal only opens drive paths and wsl.localhost
+shares). Applies only when WSL_DISTRO_NAME is set; other links pass through.
+
+Changed files (Apache-2.0 section 4(b) notice): src/protocol/render_ansi.rs.
+
+diff --git a/src/protocol/render_ansi.rs b/src/protocol/render_ansi.rs
+index 9865360..40c6212 100644
+--- a/src/protocol/render_ansi.rs
++++ b/src/protocol/render_ansi.rs
+@@ -906,7 +906,54 @@ fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
+         .chars()
+         .filter(|ch| *ch != '\x1b' && *ch != '\x07' && !ch.is_control())
+         .collect();
+-    (!sanitized.is_empty()).then_some(sanitized)
++    (!sanitized.is_empty()).then(|| wsl_host_file_uri(sanitized))
++}
++
++/// Under WSL the host terminal is usually Windows Terminal, which opens
++/// `file://` links only to Windows drive paths or `\\wsl.localhost` shares,
++/// not to Linux paths. Rewrite `file:///home/...` to
++/// `file://wsl.localhost/<distro>/home/...` and `file:///mnt/c/...` to
++/// `file:///C:/...` so links from programs in panes open on Windows.
++fn wsl_host_file_uri(uri: String) -> String {
++    static DISTRO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
++    let distro = DISTRO.get_or_init(|| {
++        std::env::var("WSL_DISTRO_NAME")
++            .ok()
++            .filter(|name| !name.is_empty())
++    });
++    match distro {
++        Some(distro) => rewrite_wsl_file_uri(&uri, distro).unwrap_or(uri),
++        None => uri,
++    }
++}
++
++fn rewrite_wsl_file_uri(uri: &str, distro: &str) -> Option<String> {
++    let scheme = uri.get(..7)?;
++    if !scheme.eq_ignore_ascii_case("file://") {
++        return None;
++    }
++    let rest = &uri[7..];
++    // Only local paths: an empty host or "localhost". Other hosts (including
++    // wsl.localhost) and drive paths are already understood.
++    let path = rest.strip_prefix("localhost").unwrap_or(rest);
++    let bytes = path.as_bytes();
++    if bytes.first() != Some(&b'/') {
++        return None;
++    }
++    if bytes.len() >= 3 && bytes[1].is_ascii_alphabetic() && matches!(bytes[2], b':' | b'|') {
++        return None;
++    }
++    if let Some(drive_path) = path.strip_prefix("/mnt/") {
++        let mut chars = drive_path.chars();
++        if let (Some(letter), next) = (chars.next(), chars.next()) {
++            if letter.is_ascii_alphabetic() && matches!(next, None | Some('/')) {
++                let tail = &drive_path[1..];
++                let tail = if tail.is_empty() { "/" } else { tail };
++                return Some(format!("file:///{}:{tail}", letter.to_ascii_uppercase()));
++            }
++        }
++    }
++    Some(format!("file://wsl.localhost/{}{path}", distro.replace(' ', "%20")))
+ }
+ 
+ fn sanitized_frame_hyperlinks(frame: &FrameData) -> Vec<Option<String>> {
+@@ -1061,6 +1108,35 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn rewrites_wsl_file_uris_for_windows_terminal() {
++        let r = |uri| rewrite_wsl_file_uri(uri, "Ubuntu-26.04");
++        assert_eq!(
++            r("file:///home/me/repo").as_deref(),
++            Some("file://wsl.localhost/Ubuntu-26.04/home/me/repo")
++        );
++        assert_eq!(
++            r("file://localhost/etc/hosts").as_deref(),
++            Some("file://wsl.localhost/Ubuntu-26.04/etc/hosts")
++        );
++        assert_eq!(r("FILE:///tmp/x").as_deref(), Some("file://wsl.localhost/Ubuntu-26.04/tmp/x"));
++        assert_eq!(r("file:///mnt/c/Users/me").as_deref(), Some("file:///C:/Users/me"));
++        assert_eq!(r("file:///mnt/d").as_deref(), Some("file:///D:/"));
++        assert_eq!(
++            r("file:///mnt/data/x").as_deref(),
++            Some("file://wsl.localhost/Ubuntu-26.04/mnt/data/x")
++        );
++        assert_eq!(r("file:///C:/Users/me"), None);
++        assert_eq!(r("file://wsl.localhost/Ubuntu-26.04/home/me"), None);
++        assert_eq!(r("file://other-host/share"), None);
++        assert_eq!(r("https://example.com/home"), None);
++        assert_eq!(r("file:"), None);
++        assert_eq!(
++            rewrite_wsl_file_uri("file:///x", "My Distro").as_deref(),
++            Some("file://wsl.localhost/My%20Distro/x")
++        );
++    }
+     use crate::protocol::{CellData, CursorState};
+ 
+     const WIDE_GRAPHEME: &str = "💡";

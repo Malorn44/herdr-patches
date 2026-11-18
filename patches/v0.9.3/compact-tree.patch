@@ -1,5 +1,5 @@
 herdr compact tree patch for herdr v0.9.3
-https://github.com/Malorn44/herdr-compact-tree-patch
+https://github.com/Malorn44/herdr-patches
 
 Makes the text drawn before each line of a Space entry in the Spaces sidebar
 configurable under [ui.sidebar.spaces.tree]. The defaults reproduce herdr's

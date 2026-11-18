@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Build herdr from an official release tag with the compact tree patch applied.
+# Build herdr from an official release tag with the patches in patches/<version>/ applied.
 #
-#   ./build.sh [--install] [VERSION]
+#   ./build.sh [--install] [--patch NAME]... [VERSION]
+#   ./build.sh --list
 #
 #   VERSION     a herdr release tag with a folder under patches/ (default: the
 #               newest one there)
 #   --install   copy the build over your current herdr (backed up first);
 #               restart the herdr server afterwards to use it
+#   --patch     apply only this patch (repeatable; default: every patch for
+#               the version). NAME is the file name without .patch
+#   --list      show the patches for each version
 #
 # Environment:
 #   INSTALL_DIR   where --install puts herdr (default: the directory of the
 #                 herdr on your PATH, else ~/.local/bin)
-#   WORK_DIR      clone/build directory (default: ~/.cache/herdr-compact-tree)
+#   WORK_DIR      clone/build directory (default: ~/.cache/herdr-patches)
 #
 # Needs git, curl, and rustup/cargo (herdr pins its Rust version). Zig, which
 # herdr's terminal library needs, is downloaded once and checksum-verified.
@@ -20,16 +24,23 @@ set -euo pipefail
 
 ZIG_VERSION=0.16.0
 here=$(cd "$(dirname "$0")" && pwd)
-data=${XDG_DATA_HOME:-$HOME/.local/share}/herdr-compact-tree
-work=${WORK_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/herdr-compact-tree}
+data=${XDG_DATA_HOME:-$HOME/.local/share}/herdr-patches
+work=${WORK_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/herdr-patches}
 
 install=0
 version=""
+chosen=()
 while [ $# -gt 0 ]; do
   arg=$1; shift
   case "$arg" in
     --install) install=1 ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --patch) chosen+=("${1:?--patch needs a name}"); shift ;;
+    --list)
+      for d in "$here"/patches/*/; do
+        echo "$(basename "$d"): $(ls "$d" | sed -n 's/\.patch$//p' | tr '\n' ' ')"
+      done
+      exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     v*) version=$arg ;;
     *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
   esac
@@ -42,6 +53,16 @@ if [ ! -d "$patch_dir" ]; then
   echo "no patch for herdr $version; supported: $(ls "$here/patches" | tr '\n' ' ')" >&2
   exit 1
 fi
+available=$(ls "$patch_dir" | sed -n 's/\.patch$//p')
+if [ ${#chosen[@]} -eq 0 ]; then
+  mapfile -t chosen <<< "$available"
+fi
+for name in "${chosen[@]}"; do
+  if ! grep -qx -- "$name" <<< "$available"; then
+    echo "no patch '$name' for herdr $version; available: $(tr '\n' ' ' <<< "$available")" >&2
+    exit 1
+  fi
+done
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
@@ -69,7 +90,8 @@ src="$work/herdr-$version"
 rm -rf "$src"
 mkdir -p "$work"
 git clone --quiet --depth 1 --branch "$version" https://github.com/herdrdev/herdr.git "$src" 2>/dev/null
-for p in "$patch_dir"/*.patch; do
+for name in "${chosen[@]}"; do
+  p="$patch_dir/$name.patch"
   if ! git -C "$src" apply --check "$p" 2>/dev/null; then
     echo "$(basename "$p") doesn't apply to herdr $version" >&2
     exit 1
@@ -99,7 +121,7 @@ for attempt in $(seq 1 15); do
   rm "$work/$(basename "$url")"
 done
 
-out="$work/herdr-$version-compact-tree"
+out="$work/herdr-$version$(printf '+%s' "${chosen[@]}")"
 cp "$src/target/release/herdr" "$out"
 echo "built $out"
 
