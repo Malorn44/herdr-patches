@@ -1,0 +1,10 @@
+# thin: one-column connectors
+# Apply with ./preset.sh NAME, or copy the table into herdr's config.toml.
+[ui.sidebar.spaces.tree]
+top_first = ""
+top_rest = "  "
+group_rest = "│ "
+child_first = "├ "
+last_child_first = "└ "
+child_rest = "│ "
+last_child_rest = "  "

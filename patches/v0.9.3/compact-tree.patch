@@ -1,0 +1,205 @@
+herdr compact tree patch for herdr v0.9.3
+https://github.com/Malorn44/herdr-compact-tree-patch
+
+Makes the text drawn before each line of a Space entry in the Spaces sidebar
+configurable under [ui.sidebar.spaces.tree]. The defaults reproduce herdr's
+built-in tree exactly; nothing changes until you set them.
+
+Changed files (Apache-2.0 section 4(b) notice): src/config/sidebar.rs,
+src/config.rs, src/client/shell/sidebar.rs, src/client/shell/endpoint_sidebar.rs.
+
+diff --git a/src/client/shell/endpoint_sidebar.rs b/src/client/shell/endpoint_sidebar.rs
+index 9698248..5140939 100644
+--- a/src/client/shell/endpoint_sidebar.rs
++++ b/src/client/shell/endpoint_sidebar.rs
+@@ -474,6 +474,11 @@ pub(super) fn render_expanded(
+                     status,
+                     config.status_indicators,
+                     entry,
++                    matches!(
++                        rows.get(row_index + 1),
++                        Some(Row::Workspace { entry: next, .. }) if next.indented
++                    ),
++                    &config.spaces.tree,
+                     tokens,
+                     endpoint_active && workspace.focused,
+                     selected,
+diff --git a/src/client/shell/sidebar.rs b/src/client/shell/sidebar.rs
+index f94f6bd..727b693 100644
+--- a/src/client/shell/sidebar.rs
++++ b/src/client/shell/sidebar.rs
+@@ -327,6 +327,10 @@ pub(crate) fn render_sidebar(
+             status,
+             config.status_indicators,
+             entry,
++            entries
++                .get(entry_position + 1)
++                .is_some_and(|next| next.indented),
++            &config.spaces.tree,
+             rows,
+             workspace.focused,
+             selected,
+@@ -658,6 +662,8 @@ pub(in crate::client::shell) fn render_workspace_rows(
+     status: crate::api::schema::AgentStatus,
+     indicators: crate::config::StatusIndicatorStyle,
+     entry: &WorkspaceEntry,
++    has_children: bool,
++    tree: &crate::config::SpaceTreeConfig,
+     rows: Vec<Vec<crate::ui::ResolvedToken>>,
+     focused: bool,
+     selected: bool,
+@@ -670,32 +676,24 @@ pub(in crate::client::shell) fn render_workspace_rows(
+         if y >= area.bottom() {
+             break;
+         }
+-        let mut x = area.x;
+-        if entry.indented {
+-            let prefix = if row_index == 0 {
+-                if entry.last_child {
+-                    "   └─ "
+-                } else {
+-                    "   ├─ "
+-                }
+-            } else if entry.last_child {
+-                "        "
+-            } else {
+-                "   │    "
+-            };
+-            x = put_segment(
+-                buffer,
+-                x,
+-                y,
+-                area.right(),
+-                prefix,
+-                Style::default().fg(palette.overlay0),
+-            );
+-        } else if row_index == 0 {
+-            x = x.saturating_add(1);
+-        } else {
+-            x = x.saturating_add(3);
+-        }
++        let first = row_index == 0;
++        let prefix = match (entry.indented, entry.last_child, first) {
++            (true, false, true) => &tree.child_first,
++            (true, true, true) => &tree.last_child_first,
++            (true, false, false) => &tree.child_rest,
++            (true, true, false) => &tree.last_child_rest,
++            (false, _, true) => &tree.top_first,
++            (false, _, false) if has_children => &tree.group_rest,
++            (false, _, false) => &tree.top_rest,
++        };
++        let x = put_segment(
++            buffer,
++            area.x,
++            y,
++            area.right(),
++            prefix,
++            Style::default().fg(palette.overlay0),
++        );
+         let highlighted = focused || dragged;
+         let workspace_style = Style::default()
+             .fg(if highlighted {
+diff --git a/src/config.rs b/src/config.rs
+index 8550097..58e3323 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -30,7 +30,7 @@ pub use self::{
+     },
+     sidebar::{
+         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
+-        SpaceSidebarToken, SpacesSidebarConfig,
++        SpaceSidebarToken, SpaceTreeConfig, SpacesSidebarConfig,
+     },
+     sound::SoundConfig,
+     tab_bar::TabBarRightEntryConfig,
+diff --git a/src/config/sidebar.rs b/src/config/sidebar.rs
+index 9a4cb5e..1faadb8 100644
+--- a/src/config/sidebar.rs
++++ b/src/config/sidebar.rs
+@@ -461,6 +461,7 @@ pub struct SpacesSidebarConfig {
+     #[serde(deserialize_with = "deserialize_sidebar_rows")]
+     pub rows: SpaceSidebarRows,
+     pub row_gap: u16,
++    pub tree: SpaceTreeConfig,
+ }
+ 
+ impl Default for SpacesSidebarConfig {
+@@ -471,6 +472,43 @@ impl Default for SpacesSidebarConfig {
+                 vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+             ],
+             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
++            tree: SpaceTreeConfig::default(),
++        }
++    }
++}
++
++/// Text drawn before each line of a Space entry in the expanded sidebar.
++/// The defaults are Herdr's built-in tree; override any of them in
++/// `[ui.sidebar.spaces.tree]` for a more compact one.
++#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
++#[serde(default)]
++pub struct SpaceTreeConfig {
++    /// First line of a top-level Space.
++    pub top_first: String,
++    /// Later lines of a top-level Space without visible worktree children.
++    pub top_rest: String,
++    /// Later lines of a top-level Space whose worktree children are shown.
++    pub group_rest: String,
++    /// First line of a worktree child.
++    pub child_first: String,
++    /// First line of the last worktree child.
++    pub last_child_first: String,
++    /// Later lines of a worktree child.
++    pub child_rest: String,
++    /// Later lines of the last worktree child.
++    pub last_child_rest: String,
++}
++
++impl Default for SpaceTreeConfig {
++    fn default() -> Self {
++        Self {
++            top_first: " ".into(),
++            top_rest: "   ".into(),
++            group_rest: "   ".into(),
++            child_first: "   ├─ ".into(),
++            last_child_first: "   └─ ".into(),
++            child_rest: "   │    ".into(),
++            last_child_rest: "        ".into(),
+         }
+     }
+ }
+@@ -513,6 +551,34 @@ mod tests {
+         assert_eq!(config.spaces.row_gap, 0);
+     }
+ 
++    #[test]
++    fn parses_partial_space_tree_override_and_keeps_other_defaults() {
++        let config: crate::config::Config = toml::from_str(
++            r#"
++[ui.sidebar.spaces.tree]
++top_first = ""
++group_rest = "│ "
++child_first = "├─ "
++child_rest = "│  "
++"#,
++        )
++        .expect("space tree config");
++
++        let tree = &config.ui.sidebar.spaces.tree;
++        assert_eq!(tree.top_first, "");
++        assert_eq!(tree.group_rest, "│ ");
++        assert_eq!(tree.child_first, "├─ ");
++        assert_eq!(tree.child_rest, "│  ");
++        let defaults = SpaceTreeConfig::default();
++        assert_eq!(tree.top_rest, defaults.top_rest);
++        assert_eq!(tree.last_child_first, defaults.last_child_first);
++        assert_eq!(tree.last_child_rest, defaults.last_child_rest);
++        assert_eq!(
++            config.ui.sidebar.spaces.rows,
++            SpacesSidebarConfig::default().rows
++        );
++    }
++
+     #[test]
+     fn parses_builtin_and_arbitrary_custom_tokens() {
+         let config: crate::config::Config = toml::from_str(
