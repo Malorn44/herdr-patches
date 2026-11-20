@@ -51,6 +51,12 @@ is the text drawn before a sidebar line:
 Nothing to set: it applies when `WSL_DISTRO_NAME` is set. Web links, `C:/...` paths and links already in the
 `wsl.localhost` form pass through unchanged.
 
+A Linux path that is really a symlink into a Windows drive (say `~/notes` pointing at `/mnt/c/Users/me/Notes`) is
+followed first and links to `C:/Users/me/Notes`. Through `wsl.localhost`, Windows can't follow the symlink: a folder
+gives "access denied" and the link itself shows up as a file with no app to open it. This also applies to links
+already in this distro's `wsl.localhost` form (Claude Code writes its file links that way), and to `wsl.localhost`
+links into `/mnt/<drive>`.
+
 ## Supported versions
 
 | herdr | Patches |

@@ -5,15 +5,19 @@ Under WSL, rewrites file:// links that programs in panes print so Windows
 Terminal can open them: file:///home/... becomes
 file://wsl.localhost/<distro>/home/... and file:///mnt/c/... becomes
 file:///C:/... (Windows Terminal only opens drive paths and wsl.localhost
-shares). Applies only when WSL_DISTRO_NAME is set; other links pass through.
+shares). A Linux path that is a symlink into /mnt/<drive> (e.g. ~/notes ->
+a Windows folder) is followed first and links to the drive path, since
+Windows can't follow it through the share. That includes links already in
+this distro's wsl.localhost form, which Claude Code writes itself. Applies only when
+WSL_DISTRO_NAME is set; other links pass through.
 
 Changed files (Apache-2.0 section 4(b) notice): src/protocol/render_ansi.rs.
 
 diff --git a/src/protocol/render_ansi.rs b/src/protocol/render_ansi.rs
-index 9865360..40c6212 100644
+index 9865360..db51958 100644
 --- a/src/protocol/render_ansi.rs
 +++ b/src/protocol/render_ansi.rs
-@@ -906,7 +906,54 @@ fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
+@@ -906,7 +906,167 @@ fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
          .chars()
          .filter(|ch| *ch != '\x1b' && *ch != '\x07' && !ch.is_control())
          .collect();
@@ -25,18 +29,131 @@ index 9865360..40c6212 100644
 +/// `file://` links only to Windows drive paths or `\\wsl.localhost` shares,
 +/// not to Linux paths. Rewrite `file:///home/...` to
 +/// `file://wsl.localhost/<distro>/home/...` and `file:///mnt/c/...` to
-+/// `file:///C:/...` so links from programs in panes open on Windows.
++/// `file:///C:/...` so links from programs in panes open on Windows. A Linux
++/// path that is a symlink into `/mnt/<drive>` (e.g. `~/notes` pointing at a
++/// Windows folder) is followed first: Windows can't follow it through the
++/// share, so it links to the drive path instead.
 +fn wsl_host_file_uri(uri: String) -> String {
-+    static DISTRO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
++    use std::collections::HashMap;
++    use std::sync::{Mutex, OnceLock};
++    static DISTRO: OnceLock<Option<String>> = OnceLock::new();
++    // Links are sanitized on every frame; resolve each one once.
++    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 +    let distro = DISTRO.get_or_init(|| {
 +        std::env::var("WSL_DISTRO_NAME")
 +            .ok()
 +            .filter(|name| !name.is_empty())
 +    });
-+    match distro {
-+        Some(distro) => rewrite_wsl_file_uri(&uri, distro).unwrap_or(uri),
-+        None => uri,
++    let Some(distro) = distro else {
++        return uri;
++    };
++    if !uri.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("file://")) {
++        return uri;
 +    }
++    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
++    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&uri).cloned()) {
++        return hit;
++    }
++    let resolved = resolve_into_drive(&uri, distro, |path| std::fs::canonicalize(path).ok());
++    let out = rewrite_wsl_file_uri(resolved.as_deref().unwrap_or(&uri), distro)
++        .unwrap_or_else(|| uri.clone());
++    if let Ok(mut c) = cache.lock() {
++        if c.len() >= 512 {
++            c.clear();
++        }
++        c.insert(uri, out.clone());
++    }
++    out
++}
++
++/// For a `file://` link to a Linux path (local, or this distro's
++/// `wsl.localhost`/`wsl$` share) whose real location is under `/mnt/`, return
++/// a local link to that real location; otherwise `None`. Claude Code, for one,
++/// writes its file links in the `wsl.localhost` form itself.
++#[cfg(unix)]
++fn resolve_into_drive(
++    uri: &str,
++    distro: &str,
++    canonicalize: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
++) -> Option<String> {
++    use std::os::unix::ffi::{OsStrExt, OsStringExt};
++    let rest = uri.get(7..)?;
++    let path = match share_path(rest, distro) {
++        Some(path) => {
++            // Already a share link: a /mnt/<drive> path only needs the drive form.
++            if path.starts_with("/mnt/") {
++                return Some(format!("file://{path}"));
++            }
++            path
++        }
++        None => rest.strip_prefix("localhost").unwrap_or(rest),
++    };
++    if !path.starts_with('/') || path.starts_with("/mnt/") {
++        return None;
++    }
++    let (path, suffix) = path.split_at(path.find(['?', '#']).unwrap_or(path.len()));
++    let decoded = std::ffi::OsString::from_vec(percent_decode(path));
++    let real = canonicalize(std::path::Path::new(&decoded))?;
++    let real = real.as_os_str().as_bytes();
++    real.starts_with(b"/mnt/")
++        .then(|| format!("file://{}{suffix}", percent_encode_path(real)))
++}
++
++/// The Linux path in `wsl.localhost/<distro>/...` or `wsl$/<distro>/...`, when
++/// `<distro>` is this one.
++fn share_path<'a>(rest: &'a str, distro: &str) -> Option<&'a str> {
++    let host_len = rest.find('/')?;
++    let host = &rest[..host_len];
++    if !host.eq_ignore_ascii_case("wsl.localhost") && !host.eq_ignore_ascii_case("wsl$") {
++        return None;
++    }
++    let after = &rest[host_len + 1..];
++    let name_len = after.find('/').unwrap_or(after.len());
++    let name = String::from_utf8(percent_decode(&after[..name_len])).ok()?;
++    if !name.eq_ignore_ascii_case(distro) {
++        return None;
++    }
++    let path = &after[name_len..];
++    Some(if path.is_empty() { "/" } else { path })
++}
++
++#[cfg(not(unix))]
++fn resolve_into_drive(
++    _uri: &str,
++    _distro: &str,
++    _canonicalize: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
++) -> Option<String> {
++    None
++}
++
++fn percent_decode(text: &str) -> Vec<u8> {
++    let bytes = text.as_bytes();
++    let mut out = Vec::with_capacity(bytes.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] == b'%' {
++            if let Some(byte) = text.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
++                out.push(byte);
++                i += 3;
++                continue;
++            }
++        }
++        out.push(bytes[i]);
++        i += 1;
++    }
++    out
++}
++
++fn percent_encode_path(bytes: &[u8]) -> String {
++    let mut out = String::with_capacity(bytes.len());
++    for &b in bytes {
++        if b.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&b) {
++            out.push(b as char);
++        } else {
++            out.push_str(&format!("%{b:02X}"));
++        }
++    }
++    out
 +}
 +
 +fn rewrite_wsl_file_uri(uri: &str, distro: &str) -> Option<String> {
@@ -69,10 +186,47 @@ index 9865360..40c6212 100644
  }
  
  fn sanitized_frame_hyperlinks(frame: &FrameData) -> Vec<Option<String>> {
-@@ -1061,6 +1108,35 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
+@@ -1061,6 +1221,72 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
  #[cfg(test)]
  mod tests {
      use super::*;
++
++    #[cfg(unix)]
++    #[test]
++    fn follows_symlinks_into_windows_drives() {
++        use std::path::{Path, PathBuf};
++        let canon = |p: &Path| match p.to_str()? {
++            "/home/me/notes" => Some(PathBuf::from("/mnt/c/Users/me/My Notes")),
++            "/home/me/notes/Weekly/a b.md" => Some(PathBuf::from("/mnt/c/Users/me/My Notes/Weekly/a b.md")),
++            "/home/me/repo" => Some(PathBuf::from("/home/me/repo")),
++            _ => None,
++        };
++        let r = |uri| resolve_into_drive(uri, "Ubuntu-26.04", canon);
++        assert_eq!(r("file:///home/me/notes").as_deref(), Some("file:///mnt/c/Users/me/My%20Notes"));
++        assert_eq!(
++            r("file://wsl.localhost/Ubuntu-26.04/home/me/notes/Weekly/a%20b.md").as_deref(),
++            Some("file:///mnt/c/Users/me/My%20Notes/Weekly/a%20b.md")
++        );
++        assert_eq!(r("file://WSL$/ubuntu-26.04/home/me/notes").as_deref(), Some("file:///mnt/c/Users/me/My%20Notes"));
++        assert_eq!(
++            r("file://wsl.localhost/Ubuntu-26.04/mnt/c/Users/me").as_deref(),
++            Some("file:///mnt/c/Users/me")
++        );
++        assert_eq!(r("file://wsl.localhost/Ubuntu-26.04/home/me/repo"), None);
++        assert_eq!(r("file://wsl.localhost/Other/home/me/notes"), None);
++        assert_eq!(
++            r("file://localhost/home/me/notes/Weekly/a%20b.md#L3").as_deref(),
++            Some("file:///mnt/c/Users/me/My%20Notes/Weekly/a%20b.md#L3")
++        );
++        assert_eq!(r("file:///home/me/repo"), None);
++        assert_eq!(r("file:///home/me/missing"), None);
++        assert_eq!(r("file:///mnt/c/x"), None);
++        let to_drive = r("file:///home/me/notes").unwrap();
++        assert_eq!(
++            rewrite_wsl_file_uri(&to_drive, "Ubuntu-26.04").as_deref(),
++            Some("file:///C:/Users/me/My%20Notes")
++        );
++    }
 +
 +    #[test]
 +    fn rewrites_wsl_file_uris_for_windows_terminal() {
